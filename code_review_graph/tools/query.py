@@ -351,10 +351,10 @@ def query_graph(
             # Naming-convention fallback for tests not linked by TESTED_BY edges
             name = node.name if node else target
             for prefix in (f"test_{name}", f"Test{name}"):
-                for t in store.search_nodes(prefix, limit=10):
-                    if t.qualified_name not in seen and t.is_test:
-                        seen.add(t.qualified_name)
-                        results.append(node_to_dict(t))
+                for candidate in store.search_nodes(prefix, limit=10):
+                    if candidate.qualified_name not in seen and candidate.is_test:
+                        seen.add(candidate.qualified_name)
+                        results.append(node_to_dict(candidate))
 
         elif pattern == "inheritors_of":
             for e in store.get_edges_by_target(qn):
