@@ -40,7 +40,7 @@ def get_hub_nodes_func(
     ]
     if detail_level == "minimal":
         minimal_hubs = [
-            {k: h[k] for k in ("name", "kind", "degree") if k in h}
+            {k: h[k] for k in ("name", "kind", "in_degree", "out_degree", "total_degree") if k in h}
             for h in hubs
         ]
         return {
@@ -85,7 +85,7 @@ def get_bridge_nodes_func(
     ]
     if detail_level == "minimal":
         minimal_bridges = [
-            {k: b[k] for k in ("name", "kind", "centrality") if k in b}
+            {k: b[k] for k in ("name", "kind", "betweenness") if k in b}
             for b in bridges
         ]
         return {
@@ -176,7 +176,7 @@ def get_surprising_connections_func(
     ]
     if detail_level == "minimal":
         minimal = [
-            {k: s[k] for k in ("source", "target", "surprise_score") if k in s}
+            {k: s[k] for k in ("source", "target", "surprise_score", "reasons") if k in s}
             for s in surprises
         ]
         return {
