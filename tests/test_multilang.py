@@ -2635,11 +2635,11 @@ class TestYamlConfigParsing:
     def test_nested_keys_are_flattened(self):
         names = {n.name for n in self.nodes}
         assert "spring.datasource.url" in names
-        assert "spring.kafka.bootstrap-servers" in names
+        assert "spring.kafka.bootstrapServers" in names
 
     def test_deep_nested_key(self):
         names = {n.name for n in self.nodes}
-        assert "app.payment.gateway-url" in names
+        assert "app.payment.gatewayUrl" in names
 
     def test_config_value_stored_in_extra(self):
         url_node = next(
@@ -2673,3 +2673,87 @@ class TestPropertiesConfigParsing:
         node = next((n for n in self.nodes if n.name == "app.kafka.topic"), None)
         assert node is not None
         assert node.extra.get("config_value") == "order.created"
+
+
+class TestBeanParameterInjection:
+    """@Bean method parameters should emit INJECTS edges so the Spring DI resolver
+    can map field receivers to their declared types."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "SpringDI.java")
+        self.injects = [e for e in self.edges if e.kind == "INJECTS"]
+
+    def test_bean_parameter_emits_injects_edge(self):
+        """notificationService(@Bean param OrderRepository) must create an INJECTS edge."""
+        targets = {e.target for e in self.injects}
+        assert "OrderRepository" in targets
+
+    def test_bean_parameter_injection_type_is_tagged(self):
+        edge = next(
+            (e for e in self.injects if e.extra.get("injection_type") == "bean_parameter"),
+            None,
+        )
+        assert edge is not None
+
+    def test_bean_parameter_field_name_stored(self):
+        edge = next(
+            (e for e in self.injects
+             if e.extra.get("injection_type") == "bean_parameter"
+             and e.extra.get("field_name") == "orderRepository"),
+            None,
+        )
+        assert edge is not None
+
+
+class TestWebFluxFunctionalRoutingPaths:
+    """route().GET("/path", handler::method) should create Endpoint nodes + HANDLES edges."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "SampleJava.java")
+        self.endpoints = [n for n in self.nodes if n.kind == "Endpoint"]
+        self.handles = [e for e in self.edges if e.kind == "HANDLES"]
+
+    def test_get_route_creates_endpoint_node(self):
+        paths = {n.extra.get("path") for n in self.endpoints}
+        assert "/items" in paths
+
+    def test_post_route_creates_endpoint_node(self):
+        methods = {n.extra.get("http_method") for n in self.endpoints}
+        assert "POST" in methods
+
+    def test_endpoint_name_includes_http_method_and_path(self):
+        names = {n.name for n in self.endpoints}
+        assert "GET /items" in names or "POST /items" in names
+
+    def test_handles_edge_links_router_method_to_endpoint(self):
+        targets = {e.target for e in self.handles}
+        assert any(t.startswith("http:") for t in targets)
+
+
+class TestConfigKeyNormalization:
+    """YAML kebab-case keys and @Value camelCase refs should resolve to the same name."""
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.yaml_nodes, _ = self.parser.parse_file(FIXTURES / "application.yml")
+        _, self.java_edges = self.parser.parse_file(FIXTURES / "SpringDI.java")
+        self.config_edges = [
+            e for e in self.java_edges if e.kind == "DEPENDS_ON_CONFIG"
+        ]
+
+    def test_yaml_kebab_key_is_normalized_to_camel(self):
+        """app.payment.gateway-url in YAML should become app.payment.gatewayUrl in graph."""
+        names = {n.name for n in self.yaml_nodes}
+        assert "app.payment.gatewayUrl" in names
+
+    def test_value_annotation_key_normalized(self):
+        """@Value("${payment.gateway.url}") target should be config:payment.gateway.url."""
+        targets = {e.target for e in self.config_edges}
+        assert any("payment.gateway" in t for t in targets)
+
+    def test_configuration_properties_prefix_normalized(self):
+        """@ConfigurationProperties(prefix="app.kafka") target should use normalized prefix."""
+        targets = {e.target for e in self.config_edges}
+        assert any("app.kafka" in t for t in targets)

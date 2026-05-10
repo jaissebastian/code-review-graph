@@ -70,6 +70,11 @@ class AppConfig {
     public OrderRepository orderRepository() {
         return new JpaOrderRepository();
     }
+
+    @Bean
+    public NotificationService notificationService(OrderRepository orderRepository) {
+        return new NotificationService();
+    }
 }
 
 class Order {

@@ -485,6 +485,29 @@ _TEMPORAL_METHOD_ANNOTATIONS = frozenset({
 # Kafka consumer annotations (annotation-based pattern)
 _KAFKA_LISTENER_ANNOTATIONS = frozenset({"KafkaListener", "KafkaHandler"})
 
+# WebFlux fluent router HTTP verb method names
+_WEBFLUX_HTTP_VERBS: frozenset[str] = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH"})
+
+
+def _normalize_config_key(key: str) -> str:
+    """Normalize a Spring config key to camelCase for relaxed-binding matching.
+
+    Spring accepts kebab-case (task-queue), camelCase (taskQueue), and
+    SCREAMING_SNAKE (TASK_QUEUE) interchangeably. Normalise to camelCase
+    so that YAML keys and @Value keys resolve to the same node name.
+    """
+    parts = key.split(".")
+    normalized = []
+    for part in parts:
+        # Convert kebab-case and SCREAMING_SNAKE segments to camelCase
+        if "-" in part or "_" in part:
+            tokens = re.split(r"[-_]", part)
+            part = tokens[0].lower() + "".join(t.capitalize() for t in tokens[1:])
+        else:
+            part = part[0].lower() + part[1:] if part else part
+        normalized.append(part)
+    return ".".join(normalized)
+
 # Spring MVC / WebFlux annotation → HTTP method mapping
 _HTTP_MAPPING_ANNOTATIONS: dict[str, str] = {
     "GetMapping": "GET",
@@ -2110,16 +2133,21 @@ class CodeParser:
                 full_key = full_key.lstrip(".")
 
                 if value_part and not value_part.startswith("#"):
-                    # Scalar leaf
+                    # Scalar leaf — store both raw and normalised key
+                    norm_key = _normalize_config_key(full_key)
                     nodes.append(NodeInfo(
                         kind="ConfigProperty",
-                        name=full_key,
+                        name=norm_key,
                         file_path=file_path_str,
                         line_start=lineno,
                         line_end=lineno,
                         language="yaml",
                         parent_name=None,
-                        extra={"config_value": value_part, "source_file": path.name},
+                        extra={
+                            "config_value": value_part,
+                            "source_file": path.name,
+                            "raw_key": full_key,
+                        },
                     ))
                 else:
                     # Mapping key — push onto stack
@@ -4160,7 +4188,7 @@ class CodeParser:
                         edges.append(EdgeInfo(
                             kind="DEPENDS_ON_CONFIG",
                             source=qualified_source,
-                            target=f"config:{prefix}.*",
+                            target=f"config:{_normalize_config_key(prefix)}.*",
                             file_path=file_path,
                             line=class_node.start_point[0] + 1,
                             extra={"resolution": "configuration_properties", "confidence": 1.0},
@@ -4195,7 +4223,7 @@ class CodeParser:
                         edges.append(EdgeInfo(
                             kind="DEPENDS_ON_CONFIG",
                             source=qualified_source,
-                            target=f"config:{prop_key}",
+                            target=f"config:{_normalize_config_key(prop_key)}",
                             file_path=file_path,
                             line=member.start_point[0] + 1,
                             extra={"resolution": "value_annotation", "confidence": 1.0},
@@ -4367,6 +4395,51 @@ class CodeParser:
                     line=method_node.start_point[0] + 1,
                     extra={"http_method": http_method, "path": path},
                 ))
+
+    def _emit_bean_parameter_injections(
+        self,
+        method_node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit INJECTS edges for formal parameters of a @Bean factory method.
+
+        Spring instantiates @Bean method parameters from the application context,
+        making them equivalent to constructor-injected dependencies. The spring
+        resolver uses these edges to resolve method-reference receivers like
+        handler::method to their declared type.
+        """
+        qualified_source = self._qualify(
+            class_name, file_path, None
+        ) if class_name else file_path
+
+        for child in method_node.children:
+            if child.type != "formal_parameters":
+                continue
+            for param in child.children:
+                if param.type != "formal_parameter":
+                    continue
+                param_type: Optional[str] = None
+                param_name: Optional[str] = None
+                for sub in param.children:
+                    if sub.type == "type_identifier" and param_type is None:
+                        param_type = sub.text.decode("utf-8", errors="replace")
+                    elif sub.type == "identifier":
+                        param_name = sub.text.decode("utf-8", errors="replace")
+                if param_type:
+                    extra: dict = {"injection_type": "bean_parameter"}
+                    if param_name:
+                        extra["field_name"] = param_name
+                    edges.append(EdgeInfo(
+                        kind="INJECTS",
+                        source=qualified_source,
+                        target=param_type,
+                        file_path=file_path,
+                        line=param.start_point[0] + 1,
+                        extra=extra,
+                    ))
 
     def _emit_kafka_edges_from_class(
         self,
@@ -4694,6 +4767,10 @@ class CodeParser:
                 self._emit_http_endpoint_nodes_and_edges(
                     child, name, enclosing_class, file_path, nodes, edges,
                 )
+            if any(a.split("(")[0] == "Bean" for a in deco_list):
+                self._emit_bean_parameter_injections(
+                    child, name, enclosing_class, file_path, edges,
+                )
 
         node = NodeInfo(
             kind=kind,
@@ -4950,6 +5027,37 @@ class CodeParser:
                 if len(identifiers) >= 2:
                     call_extra["receiver"] = identifiers[0].text.decode("utf-8", errors="replace")
 
+            # WebFlux functional routing: route().GET("/path", handler::method)
+            # Emit an Endpoint node + HANDLES edge when a Java method_invocation
+            # named GET/POST/etc. has a string-literal first argument starting "/".
+            if (
+                language == "java"
+                and child.type == "method_invocation"
+                and call_name in _WEBFLUX_HTTP_VERBS
+            ):
+                path = self._get_webflux_route_path(child)
+                if path and enclosing_func:
+                    http_method = call_name
+                    endpoint_qn = f"http:{http_method}:{path}"
+                    nodes.append(NodeInfo(
+                        kind="Endpoint",
+                        name=f"{http_method} {path}",
+                        file_path=file_path,
+                        line_start=child.start_point[0] + 1,
+                        line_end=child.start_point[0] + 1,
+                        language="java",
+                        parent_name=enclosing_class,
+                        extra={"http_method": http_method, "path": path},
+                    ))
+                    edges.append(EdgeInfo(
+                        kind="HANDLES",
+                        source=caller,
+                        target=endpoint_qn,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                        extra={"http_method": http_method, "path": path},
+                    ))
+
             # When a receiver is present, skip scope-based resolution: the method
             # lives on the receiver's type, not in the current file's scope.
             # The spring_resolver post-pass will do the correct cross-type lookup.
@@ -4970,6 +5078,26 @@ class CodeParser:
             ))
 
         return False
+
+    @staticmethod
+    def _get_webflux_route_path(node) -> Optional[str]:
+        """Extract the path string from a WebFlux fluent .GET("/path", ...) call.
+
+        Returns the path string if the first argument in the argument_list is a
+        string literal starting with "/", otherwise None.
+        """
+        for child in node.children:
+            if child.type != "argument_list":
+                continue
+            for item in child.children:
+                if item.type == "string_literal":
+                    raw = item.text.decode("utf-8", errors="replace").strip('"').strip("'")
+                    if raw.startswith("/"):
+                        return raw
+                # Skip non-string tokens like "(" and ","
+                if item.type not in ("(", ")", ","):
+                    break
+        return None
 
     @staticmethod
     def _get_java_method_and_receiver(node) -> tuple[Optional[str], Optional[str]]:
@@ -6719,6 +6847,22 @@ class CodeParser:
             if identifiers:
                 return identifiers[0].text.decode("utf-8", errors="replace")
             return None
+
+        # Java: chained method_invocation (route().GET("/path", ...)) — the first
+        # child is the receiver expression (another method_invocation), so the actual
+        # method name is the identifier child that follows it.
+        if language == "java" and node.type == "method_invocation":
+            if first.type not in ("identifier", "simple_identifier"):
+                # Skip past the receiver and find the method name identifier
+                found_receiver = False
+                for child in node.children:
+                    if not found_receiver:
+                        if child.type not in (".", ):
+                            found_receiver = True
+                        continue
+                    if child.type == "identifier":
+                        return child.text.decode("utf-8", errors="replace")
+                return None
 
         # Java: object_creation_expression (new TrialAutomation(...)) — the
         # first child is the `new` keyword; the type name is the type_identifier.

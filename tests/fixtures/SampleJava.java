@@ -102,6 +102,22 @@ class WebFluxRouter {
     }
 }
 
+// WebFlux functional router — path literals as Endpoint nodes
+class ItemRouter {
+    private final AuditProcessor handler;
+
+    public ItemRouter(AuditProcessor handler) {
+        this.handler = handler;
+    }
+
+    public RouterFunction<ServerResponse> routes() {
+        return route()
+            .GET("/items", handler::process)
+            .POST("/items", handler::process)
+            .build();
+    }
+}
+
 // --- HTTP endpoint fixture ---
 
 @RestController
