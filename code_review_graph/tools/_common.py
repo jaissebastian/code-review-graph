@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,41 @@ def _get_store(repo_root: str | None = None) -> tuple[GraphStore, Path]:
     root = _validate_repo_root(Path(repo_root)) if repo_root else find_project_root()
     db_path = get_db_path(root)
     return GraphStore(db_path), root
+
+
+def graph_meta(store: GraphStore, root: Path) -> dict[str, Any]:
+    """Return graph freshness metadata for inclusion in tool responses.
+
+    Agents use this to detect staleness (graph lags the working branch)
+    and avoid trusting caller results that may reflect an older index.
+    Fields: indexed_at (ISO timestamp), indexed_commit (SHA at last build),
+    head_commit (current HEAD), is_stale (bool, omitted when unknown).
+    """
+    indexed_at = store.get_metadata("last_updated") or "unknown"
+    # git_head_sha is stored as the full SHA at build time
+    indexed_commit: str | None = store.get_metadata("git_head_sha")
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        head_commit: str | None = result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        head_commit = None
+
+    is_stale: bool | None = None
+    if indexed_commit and head_commit:
+        is_stale = head_commit != indexed_commit
+
+    meta: dict[str, Any] = {"indexed_at": indexed_at}
+    if indexed_commit:
+        meta["indexed_commit"] = indexed_commit[:8]
+    if head_commit:
+        meta["head_commit"] = head_commit[:8]
+    if is_stale is not None:
+        meta["is_stale"] = is_stale
+    return meta
 
 
 def compact_response(
