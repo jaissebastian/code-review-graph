@@ -27,6 +27,7 @@ _QUERY_PATTERNS = {
     "children_of": "Find all nodes contained in a file or class",
     "tests_for": "Find all tests for a given function or class",
     "inheritors_of": "Find all classes that inherit from a given class",
+    "consumers_of": "Find all classes/methods that read a given config property",
     "file_summary": "Get a summary of all nodes in a file",
 }
 
@@ -275,7 +276,8 @@ def query_graph(
                     "graph_meta": meta,
                 }
 
-        if not node and pattern != "file_summary":
+        # consumers_of can resolve via config edge keys even without a node
+        if not node and pattern not in ("file_summary", "consumers_of"):
             return {
                 "status": "not_found",
                 "summary": f"No node found matching '{target}'.",
@@ -371,6 +373,24 @@ def query_graph(
                         if child:
                             results.append(node_to_dict(child))
                         edges_out.append(edge_to_dict(e))
+
+        elif pattern == "consumers_of":
+            # Find classes/methods that read this config property.
+            # DEPENDS_ON_CONFIG edges use 'config:{key}' as target_qualified
+            # while config nodes are stored as 'file.yml::{key}'.
+            # Use the node's plain name (the config key) to bridge that gap.
+            key = node.name if node else target.removeprefix("config:")
+            for e in store.get_edges_by_config_key(key):
+                consumer = store.get_node(e.source_qualified)
+                if consumer:
+                    results.append(node_to_dict(consumer))
+                edges_out.append(edge_to_dict(e))
+            # Prefix-wildcard: @ConfigurationProperties emits 'config:prefix.*'
+            for e in store.get_edges_by_config_key(f"{key}.*"):
+                consumer = store.get_node(e.source_qualified)
+                if consumer:
+                    results.append(node_to_dict(consumer))
+                edges_out.append(edge_to_dict(e))
 
         elif pattern == "file_summary":
             abs_path = str(root / target)
@@ -756,14 +776,26 @@ def traverse_graph_func(
             traversal.append(entry)
 
             # Get neighbours
-            out_edges = store.get_edges_by_source(
-                current_qn
-            )
-            in_edges = store.get_edges_by_target(
-                current_qn
-            )
+            out_edges = store.get_edges_by_source(current_qn)
+            in_edges = store.get_edges_by_target(current_qn)
+
+            # ConfigProperty nodes: DEPENDS_ON_CONFIG edges store targets as
+            # 'config:{key}' but nodes are stored as 'file.yml::{key}'.
+            # Bridge this gap so "who reads this property?" works in BFS.
+            if node.kind == "ConfigProperty":
+                in_edges = list(in_edges) + store.get_edges_by_config_key(node.name)
+
             for e in out_edges:
                 tgt = e.target_qualified
+                # Resolve 'config:{key}' edge targets to the actual node qn
+                if tgt.startswith("config:") and not tgt.endswith(".*"):
+                    key = tgt[len("config:"):]
+                    candidates = store.search_nodes(key, limit=3)
+                    config_nodes = [c for c in candidates if c.kind == "ConfigProperty"]
+                    for cn in config_nodes:
+                        if cn.qualified_name not in visited:
+                            queue.append((cn.qualified_name, cur_depth + 1))
+                    continue
                 if tgt not in visited:
                     queue.append((tgt, cur_depth + 1))
             for e in in_edges:
@@ -779,10 +811,9 @@ def traverse_graph_func(
             "traversal": traversal,
             "truncated": approx_tokens > token_budget,
             "next_tool_suggestions": [
-                "query_graph callers_of"
-                " -- focused relationship query",
-                "get_impact_radius"
-                " -- blast radius analysis",
+                "query_graph callers_of -- focused call relationship query",
+                "query_graph consumers_of -- who reads a config property",
+                "get_impact_radius -- blast radius analysis",
             ],
         }
     finally:

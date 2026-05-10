@@ -350,6 +350,19 @@ class GraphStore:
         ).fetchall()
         return [self._row_to_edge(r) for r in rows]
 
+    def get_edges_by_config_key(self, key: str) -> list[GraphEdge]:
+        """Find DEPENDS_ON_CONFIG edges whose target is 'config:{key}'.
+
+        Config edges store targets as 'config:some.key' while config nodes
+        are stored with qualified names like 'app.yml::some.key'.  This method
+        bridges that gap so callers can find who reads a given config property.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM edges WHERE target_qualified = ? AND kind = 'DEPENDS_ON_CONFIG'",
+            (f"config:{key}",),
+        ).fetchall()
+        return [self._row_to_edge(r) for r in rows]
+
     def search_edges_by_target_name(self, name: str, kind: str = "CALLS") -> list[GraphEdge]:
         """Search for edges where target_qualified matches an unqualified name.
 

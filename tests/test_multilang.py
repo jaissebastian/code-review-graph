@@ -2757,3 +2757,54 @@ class TestConfigKeyNormalization:
         """@ConfigurationProperties(prefix="app.kafka") target should use normalized prefix."""
         targets = {e.target for e in self.config_edges}
         assert any("app.kafka" in t for t in targets)
+
+
+class TestConsumersOfPattern:
+    """query_graph consumers_of and traverse_graph must resolve config→Java edges."""
+
+    def _build(self, tmp_path):
+        from code_review_graph.graph import GraphStore
+        from code_review_graph.incremental import full_build, get_db_path
+        import shutil
+
+        (tmp_path / ".git").mkdir()
+        shutil.copy(FIXTURES / "SpringDI.java", tmp_path / "SpringDI.java")
+        shutil.copy(FIXTURES / "application.yml", tmp_path / "application.yml")
+        shutil.copy(FIXTURES / "app.properties", tmp_path / "app.properties")
+        db_path = get_db_path(tmp_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = GraphStore(db_path)
+        full_build(tmp_path, store)
+        return store
+
+    def test_get_edges_by_config_key_returns_depends_on_config(self, tmp_path):
+        store = self._build(tmp_path)
+        edges = store.get_edges_by_config_key("payment.gateway.url")
+        assert len(edges) > 0
+        assert all(e.kind == "DEPENDS_ON_CONFIG" for e in edges)
+
+    def test_consumers_of_finds_java_class_reading_config(self, tmp_path):
+        from code_review_graph.tools.query import query_graph
+        store = self._build(tmp_path)
+        result = query_graph(
+            pattern="consumers_of",
+            target="payment.gateway.url",
+            repo_root=str(tmp_path),
+        )
+        assert result.get("status") == "ok"
+        names = {r.get("name") for r in result.get("results", [])}
+        assert any("PaymentService" in (n or "") for n in names)
+
+    def test_traverse_graph_from_config_node_reaches_consumers(self, tmp_path):
+        from code_review_graph.tools.query import traverse_graph_func
+        self._build(tmp_path)
+        result = traverse_graph_func(
+            query="payment.gateway.url",
+            depth=3,
+            repo_root=str(tmp_path),
+        )
+        kinds = {n["kind"] for n in result.get("traversal", [])}
+        names = {n["name"] for n in result.get("traversal", [])}
+        # BFS from the ConfigProperty should reach the Java class that reads it
+        assert "ConfigProperty" in kinds
+        assert any("PaymentService" in (n or "") for n in names)
