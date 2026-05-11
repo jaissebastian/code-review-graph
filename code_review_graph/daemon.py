@@ -159,21 +159,36 @@ def load_config(path: Path | None = None) -> DaemonConfig:
 # ---------------------------------------------------------------------------
 
 
+def _toml_str(s: str) -> str:
+    """Return *s* as a double-quoted TOML basic string with backslashes escaped.
+
+    In TOML, backslash is an escape character inside double-quoted strings.
+    On Windows, paths contain backslashes (e.g. ``C:\\Users\\...``), which
+    ``tomllib`` mis-parses as Unicode escapes (``\\U`` → "Invalid hex value").
+    Doubling every backslash (``\\`` → ``\\\\``) produces valid TOML that
+    round-trips correctly on all platforms.
+    """
+    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _serialize_toml(config: DaemonConfig) -> str:
     """Serialize a :class:`DaemonConfig` to TOML text.
 
     ``tomllib`` is read-only, so we build the TOML manually.
+    Path values (log_dir, repo path) are serialized via :func:`_toml_str`
+    which escapes backslashes, making the output valid on Windows.
     """
     lines: list[str] = [
         "[daemon]",
         f'session_name = "{config.session_name}"',
-        f'log_dir = "{config.log_dir}"',
+        f"log_dir = {_toml_str(str(config.log_dir))}",
         f"poll_interval = {config.poll_interval}",
     ]
     for repo in config.repos:
         lines.append("")
         lines.append("[[repos]]")
-        lines.append(f'path = "{repo.path}"')
+        lines.append(f"path = {_toml_str(str(repo.path))}")
         lines.append(f'alias = "{repo.alias}"')
     lines.append("")  # trailing newline
     return "\n".join(lines)
