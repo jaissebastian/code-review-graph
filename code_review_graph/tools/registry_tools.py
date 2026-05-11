@@ -263,11 +263,14 @@ def _callers_in_store(store: GraphStore, symbol: str) -> list[dict[str, Any]]:
     2. CALLS edges by bare name (fallback for unqualified targets)
     3. TEMPORAL_STUB edges by bare name (Temporal workflow/activity cross-repo)
     """
-    # Step 1: resolve symbol → qualified name
+    # Step 1: resolve symbol → qualified name.
+    # Prefer Class/Function nodes over File/Module nodes so that interface→impl
+    # resolution (Step 5) and bare-name callers (Step 3) work correctly.
     node = store.get_node(symbol)
     if not node:
         candidates = store.search_nodes(symbol, limit=10)
-        node = candidates[0] if candidates else None
+        non_file = [c for c in candidates if c.kind not in ("File", "Module")]
+        node = non_file[0] if non_file else (candidates[0] if candidates else None)
     qn = node.qualified_name if node else symbol
     # For TEMPORAL_STUB lookup: always derive bare name from the *input* symbol
     # rather than the resolved node, because the Temporal interface may live in a
@@ -319,6 +322,46 @@ def _callers_in_store(store: GraphStore, symbol: str) -> list[dict[str, Any]]:
             d["relationship"] = "temporal"
             callers.append(d)
             seen.add(edge.source_qualified)
+
+    # Step 5: Interface → implementation resolution.
+    # When a symbol is a Java interface/abstract class, CALLS edges target the
+    # concrete implementation (e.g. ServiceImpl), not the interface name.
+    # Find implementations via INHERITS edges, then fetch their callers.
+    # Use three candidate target names: full qn, node.name, and bare input name.
+    # The INHERITS edge stores the bare class name (e.g. "ServiceA") regardless of
+    # which repo's graph is being searched, so the bare fallback is essential.
+    if not callers and node:
+        impl_rows = store._conn.execute(
+            "SELECT DISTINCT source_qualified FROM edges"
+            " WHERE kind = 'INHERITS'"
+            " AND (target_qualified = ? OR target_qualified = ? OR target_qualified = ?)",
+            (qn, node.name, bare_for_temporal),
+        ).fetchall()
+        for (impl_qn,) in impl_rows:
+            # Extract bare implementation class name for LIKE and bare-name search
+            impl_bare = impl_qn.split("::")[-1].split(".")[-1]
+            # CALLS edges to any method of this implementation (dot-qualified form)
+            impl_call_rows = store._conn.execute(
+                "SELECT source_qualified, confidence, line FROM edges"
+                " WHERE kind = 'CALLS' AND ("
+                "  target_qualified = ? OR"
+                "  target_qualified LIKE ? OR"
+                "  target_qualified LIKE ?"
+                ")",
+                (impl_qn, f"{impl_bare}.%", f"{impl_qn}.%"),
+            ).fetchall()
+            for src_qn, confidence, line in impl_call_rows:
+                if src_qn in seen:
+                    continue
+                caller_node = store.get_node(src_qn)
+                if caller_node:
+                    d = node_to_dict(caller_node)
+                    d["edge_confidence"] = confidence
+                    d["edge_line"] = line
+                    d["edge_kind"] = "CALLS"
+                    d["via_implementation"] = impl_bare
+                    callers.append(d)
+                    seen.add(src_qn)
 
     return callers
 
@@ -632,5 +675,35 @@ def _rest_matches_in_store(
                 "repo_path": repo_path_str,
             })
             seen_endpoints.add(edge.source_qualified)
+
+    # HANDLES edges — emitted for WebFlux static-predicate pattern:
+    #   RouterFunctions.route(POST("/path"), handler::method)
+    # target format: "http:<METHOD>:<path>" (note: different from rest:path:<path>)
+    # We match any HTTP method by using a LIKE query over the path suffix.
+    handles_rows = store._conn.execute(
+        "SELECT source_qualified, target_qualified, extra FROM edges"
+        " WHERE kind = 'HANDLES' AND target_qualified LIKE ?",
+        (f"http:%:{path}",),
+    ).fetchall()
+    for src_qn, tgt_qn, extra_raw in handles_rows:
+        if src_qn in seen_endpoints:
+            continue
+        # Extract HTTP method from target_qualified ("http:POST:/invoice" → "POST")
+        parts = tgt_qn.split(":", 2)
+        http_method = parts[1] if len(parts) >= 3 else "ANY"
+        endpoint_node = store.get_node(src_qn)
+        if endpoint_node:
+            endpoints.append({
+                "qualified_name": src_qn,
+                "kind": endpoint_node.kind,
+                "name": endpoint_node.name,
+                "file_path": endpoint_node.file_path,
+                "line_start": endpoint_node.line_start,
+                "http_method": http_method,
+                "rest_endpoint": path,
+                "repo": alias,
+                "repo_path": repo_path_str,
+            })
+            seen_endpoints.add(src_qn)
 
     return callers, endpoints

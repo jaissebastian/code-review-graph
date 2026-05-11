@@ -5283,7 +5283,8 @@ class CodeParser:
             # e.g. @Bean public Consumer<Message<OrderEvent>> processOrders() { ... }
             # Note: ret_type is None for Java generic return types; the method reads
             # the AST children directly as a fallback.
-            if "Bean" in deco_list:
+            # Use split("(")[0] to match both @Bean and @Bean(name="...") forms.
+            if any(a.split("(")[0] == "Bean" for a in deco_list):
                 self._emit_kafka_edges_from_stream_bean(
                     child, name, enclosing_class, file_path, ret_type, edges,
                 )
@@ -5657,10 +5658,20 @@ class CodeParser:
 
         Pattern: [receiver_identifier, '.', method_identifier, argument_list]
         Chained: [inner_method_invocation, '.', method_identifier, argument_list]
+        Static:  [identifier, argument_list]  — no receiver (static import call)
 
         Returns (None, None) for unrecognised shapes.
         """
         children = node.children
+        # Handle standalone static call: name(args) — 2 children, no receiver.
+        # Example: POST("/invoice") from `import static RequestPredicates.*`
+        # This pattern is used in RouterFunctions.route(POST("/path"), handler).
+        if (
+            len(children) == 2
+            and children[0].type == "identifier"
+            and children[1].type == "argument_list"
+        ):
+            return children[0].text.decode("utf-8", errors="replace"), None
         if len(children) < 3:
             return None, None
 
