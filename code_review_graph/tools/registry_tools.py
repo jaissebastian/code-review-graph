@@ -324,32 +324,61 @@ def _callers_in_store(store: GraphStore, symbol: str) -> list[dict[str, Any]]:
             seen.add(edge.source_qualified)
 
     # Step 5: Interface → implementation resolution.
-    # When a symbol is a Java interface/abstract class, CALLS edges target the
-    # concrete implementation (e.g. ServiceImpl), not the interface name.
-    # Find implementations via INHERITS edges, then fetch their callers.
-    # Use three candidate target names: full qn, node.name, and bare input name.
-    # The INHERITS edge stores the bare class name (e.g. "ServiceA") regardless of
+    # When a symbol is a Java interface/abstract class (or one of its methods),
+    # CALLS edges target the concrete implementation (e.g. ServiceImpl), not
+    # the interface name. Find implementations via INHERITS edges, then fetch
+    # their callers. Two sub-cases:
+    #   a) Class-level query (e.g. "ServiceA"): return callers of any method
+    #      on the implementation class.
+    #   b) Method-level query (e.g. "ServiceA.processPayment"): the resolved
+    #      node is a Function whose parent_name is the interface class. Look
+    #      up implementations of that parent, then narrow CALLS to the same
+    #      method name on each implementation.
+    #
+    # INHERITS edges store the bare class name (e.g. "ServiceA") regardless of
     # which repo's graph is being searched, so the bare fallback is essential.
     if not callers and node:
+        # Determine the interface class name and (for method queries) the method.
+        method_bare: Optional[str] = None
+        if node.kind == "Function" and node.parent_name:
+            # Method-level: parent_name holds the interface class (e.g. "ServiceA")
+            interface_bare = node.parent_name.split("::")[-1].split(".")[-1]
+            method_bare = node.name
+        else:
+            # Class-level: use the node name itself
+            interface_bare = node.name.split("::")[-1].split(".")[-1]
+
         impl_rows = store._conn.execute(
             "SELECT DISTINCT source_qualified FROM edges"
             " WHERE kind = 'INHERITS'"
             " AND (target_qualified = ? OR target_qualified = ? OR target_qualified = ?)",
-            (qn, node.name, bare_for_temporal),
+            (qn, node.name, interface_bare),
         ).fetchall()
         for (impl_qn,) in impl_rows:
-            # Extract bare implementation class name for LIKE and bare-name search
+            # Extract bare implementation class name
             impl_bare = impl_qn.split("::")[-1].split(".")[-1]
-            # CALLS edges to any method of this implementation (dot-qualified form)
-            impl_call_rows = store._conn.execute(
-                "SELECT source_qualified, confidence, line FROM edges"
-                " WHERE kind = 'CALLS' AND ("
-                "  target_qualified = ? OR"
-                "  target_qualified LIKE ? OR"
-                "  target_qualified LIKE ?"
-                ")",
-                (impl_qn, f"{impl_bare}.%", f"{impl_qn}.%"),
-            ).fetchall()
+            if method_bare:
+                # Method-level: target is exactly impl_qn + "." + method_bare
+                # e.g. "/path/ServiceAImpl.java::ServiceAImpl.processPayment"
+                impl_call_rows = store._conn.execute(
+                    "SELECT source_qualified, confidence, line FROM edges"
+                    " WHERE kind = 'CALLS' AND ("
+                    "  target_qualified = ? OR"
+                    "  target_qualified = ?"
+                    ")",
+                    (f"{impl_bare}.{method_bare}", f"{impl_qn}.{method_bare}"),
+                ).fetchall()
+            else:
+                # Class-level: any method on the implementation
+                impl_call_rows = store._conn.execute(
+                    "SELECT source_qualified, confidence, line FROM edges"
+                    " WHERE kind = 'CALLS' AND ("
+                    "  target_qualified = ? OR"
+                    "  target_qualified LIKE ? OR"
+                    "  target_qualified LIKE ?"
+                    ")",
+                    (impl_qn, f"{impl_bare}.%", f"{impl_qn}.%"),
+                ).fetchall()
             for src_qn, confidence, line in impl_call_rows:
                 if src_qn in seen:
                     continue
