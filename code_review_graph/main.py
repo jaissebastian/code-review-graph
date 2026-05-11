@@ -28,6 +28,9 @@ from .prompts import (
 from .tools import (
     apply_refactor_func,
     build_or_update_graph,
+    cross_repo_callers_func,
+    cross_repo_kafka_impact_func,
+    cross_repo_rest_callers_func,
     cross_repo_search_func,
     detect_changes_func,
     embed_graph,
@@ -937,6 +940,69 @@ def cross_repo_search_tool(
         detail_level: "standard" for full node data, "minimal" for name/kind/repo/file only.
     """
     return cross_repo_search_func(query=query, kind=kind, limit=limit, detail_level=detail_level)
+
+
+@mcp.tool()
+def cross_repo_callers_tool(
+    symbol: str,
+    limit: int = 50,
+    detail_level: str = "standard",
+) -> dict:
+    """Find all callers of a symbol across every registered repository.
+
+    Iterates every repo in the registry, runs callers_of(symbol) on each
+    graph database, and returns a merged, repo-annotated result set.
+    Answers "what calls ServiceA.processPayment across all my services?"
+    in a single call.
+
+    Register repos first with the CLI 'register' command.
+
+    Args:
+        symbol: Qualified name or plain name of the target symbol
+            (e.g. ``"ServiceA.processPayment"`` or ``"processPayment"``).
+        limit: Maximum total callers to return across all repos. Default: 50.
+        detail_level: ``"standard"`` for full node data; ``"minimal"`` for
+            compact output (name, kind, file_path, repo, edge_confidence).
+    """
+    return cross_repo_callers_func(symbol=symbol, limit=limit, detail_level=detail_level)
+
+
+@mcp.tool()
+def cross_repo_kafka_impact_tool(
+    topic_or_type: str,
+    limit: int = 50,
+) -> dict:
+    """Find all Kafka producers and consumers of a topic or message type across repos.
+
+    Scans CONSUMES and PRODUCES edges in every registered graph database and
+    matches by topic name fragment or message payload class name. Returns separate
+    producer and consumer lists, each annotated with repo and file.
+
+    Register repos first with the CLI 'register' command.
+
+    Args:
+        topic_or_type: Kafka topic name fragment (e.g. ``"order.created"``) or
+            message payload class name (e.g. ``"OrderEvent"``, ``"PaymentEvent"``).
+        limit: Maximum results per role (producers / consumers). Default: 50.
+    """
+    return cross_repo_kafka_impact_func(topic_or_type=topic_or_type, limit=limit)
+
+
+@mcp.tool()
+def cross_repo_rest_callers_tool(
+    path: str,
+    limit: int = 50,
+) -> dict:
+    """Find REST callers and endpoint implementations for a path across all registered repos.
+
+    [REGISTRY] Matches WebClient ``.uri()`` callers (REST_CALLS edges) and
+    ``@RestController`` endpoint methods whose mapped path equals *path*.
+
+    Args:
+        path: REST path to search for, e.g. ``/orders``, ``/payments``.
+        limit: Maximum results per role (callers / endpoints). Default: 50.
+    """
+    return cross_repo_rest_callers_func(path=path, limit=limit)
 
 
 @mcp.prompt()

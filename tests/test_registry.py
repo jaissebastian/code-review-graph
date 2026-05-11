@@ -240,6 +240,478 @@ class TestCrossRepoSearch:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+class TestCrossRepoCallers:
+    """Tests for cross_repo_callers_func — merges caller results across repos."""
+
+    _SCHEMA = """
+        CREATE TABLE nodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL DEFAULT 'Function',
+            name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            file_path TEXT NOT NULL DEFAULT '',
+            line_start INTEGER NOT NULL DEFAULT 0,
+            line_end INTEGER NOT NULL DEFAULT 0,
+            language TEXT NOT NULL DEFAULT 'java',
+            parent_name TEXT,
+            params TEXT,
+            return_type TEXT,
+            is_test INTEGER NOT NULL DEFAULT 0,
+            file_hash TEXT,
+            extra TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            source_qualified TEXT NOT NULL,
+            target_qualified TEXT NOT NULL,
+            file_path TEXT NOT NULL DEFAULT '',
+            line INTEGER NOT NULL DEFAULT 0,
+            extra TEXT NOT NULL DEFAULT '{}',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            confidence_tier TEXT NOT NULL DEFAULT 'EXTRACTED',
+            updated_at REAL NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+    """
+
+    def _make_db(
+        self,
+        tmp_path: Path,
+        nodes: list[tuple[str, str]],
+        edges: list[tuple[str, str, str]],
+    ) -> str:
+        """Create a minimal graph.db.
+
+        Args:
+            tmp_path: Base directory (a unique tmpdir per test).
+            nodes: List of (name, qualified_name) tuples.
+            edges: List of (kind, source_qualified, target_qualified) tuples.
+
+        Returns:
+            The repo root path (parent of ``.code-review-graph/``).
+        """
+        data_dir = tmp_path / ".code-review-graph"
+        data_dir.mkdir(parents=True)
+        db = data_dir / "graph.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(self._SCHEMA)
+        for name, qn in nodes:
+            conn.execute(
+                "INSERT INTO nodes (name, qualified_name) VALUES (?, ?)",
+                (name, qn),
+            )
+        for kind, src, tgt in edges:
+            conn.execute(
+                "INSERT INTO edges (kind, source_qualified, target_qualified)"
+                " VALUES (?, ?, ?)",
+                (kind, src, tgt),
+            )
+        conn.commit()
+        conn.close()
+        return str(tmp_path)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _mock_registry(self, repo_paths: list[str]):
+        """Return a patch context that makes Registry.list_repos() return *repo_paths*.
+
+        Registry is imported lazily inside the function body, so we patch the
+        class at its definition site (code_review_graph.registry.Registry).
+
+        get_data_dir_for_repo must return None so that incremental.get_data_dir
+        falls through to its default (<repo>/.code-review-graph/) resolution.
+        """
+        entries = [{"path": p, "alias": Path(p).name} for p in repo_paths]
+        mock_instance = MagicMock()
+        mock_instance.list_repos.return_value = entries
+        mock_instance.get_data_dir_for_repo.return_value = None
+        return patch(
+            "code_review_graph.registry.Registry",
+            return_value=mock_instance,
+        )
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
+    def test_empty_registry(self, tmp_path):
+        """Empty registry returns ok with zero callers."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        with patch(
+            "code_review_graph.registry.Registry"
+        ) as mock_cls:
+            mock_cls.return_value.list_repos.return_value = []
+            mock_cls.return_value.get_data_dir_for_repo.return_value = None
+            result = cross_repo_callers_func(symbol="ServiceA.processPayment")
+
+        assert result["status"] == "ok"
+        assert result["results"] == []
+        assert result["total_callers"] == 0
+        assert result["repos_searched"] == []
+
+    def test_no_matching_callers(self, tmp_path):
+        """Repo exists but has no CALLS edges for the symbol → empty results."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        repo = self._make_db(
+            tmp_path / "order-service",
+            nodes=[("processPayment", "ServiceA.processPayment")],
+            edges=[],
+        )
+        with self._mock_registry([repo]):
+            result = cross_repo_callers_func(symbol="ServiceA.processPayment")
+
+        assert result["status"] == "ok"
+        assert result["results"] == []
+        assert result["total_callers"] == 0
+        assert result["repos_with_callers"] == []
+        assert len(result["repos_searched"]) == 1
+
+    def test_single_repo_callers(self, tmp_path):
+        """Single repo with a CALLS edge returns caller annotated with repo."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        repo = self._make_db(
+            tmp_path / "payment-service",
+            nodes=[
+                ("processPayment", "ServiceA.processPayment"),
+                ("handleRequest", "ServiceB.handleRequest"),
+            ],
+            edges=[
+                ("CALLS", "ServiceB.handleRequest", "ServiceA.processPayment"),
+            ],
+        )
+        with self._mock_registry([repo]):
+            result = cross_repo_callers_func(symbol="ServiceA.processPayment")
+
+        assert result["status"] == "ok"
+        assert result["total_callers"] == 1
+        assert len(result["results"]) == 1
+        caller = result["results"][0]
+        assert caller["name"] == "handleRequest"
+        assert caller["repo"] == "payment-service"
+        assert "repo_path" in caller
+        assert "edge_confidence" in caller
+
+    def test_multi_repo_callers(self, tmp_path):
+        """Two repos each call the same symbol → merged results from both."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        repo_a = self._make_db(
+            tmp_path / "order-service",
+            nodes=[
+                ("processPayment", "ServiceA.processPayment"),
+                ("submitOrder", "OrderController.submitOrder"),
+            ],
+            edges=[("CALLS", "OrderController.submitOrder", "ServiceA.processPayment")],
+        )
+        repo_b = self._make_db(
+            tmp_path / "billing-service",
+            nodes=[
+                ("processPayment", "ServiceA.processPayment"),
+                ("charge", "BillingService.charge"),
+            ],
+            edges=[("CALLS", "BillingService.charge", "ServiceA.processPayment")],
+        )
+        with self._mock_registry([repo_a, repo_b]):
+            result = cross_repo_callers_func(symbol="ServiceA.processPayment")
+
+        assert result["status"] == "ok"
+        assert result["total_callers"] == 2
+        repos_with = result["repos_with_callers"]
+        assert "order-service" in repos_with
+        assert "billing-service" in repos_with
+        caller_names = {r["name"] for r in result["results"]}
+        assert "submitOrder" in caller_names
+        assert "charge" in caller_names
+
+    def test_detail_level_minimal(self, tmp_path):
+        """detail_level='minimal' returns only compact fields per result."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        repo = self._make_db(
+            tmp_path / "catalog-service",
+            nodes=[
+                ("processPayment", "ServiceA.processPayment"),
+                ("fetchItem", "CatalogService.fetchItem"),
+            ],
+            edges=[("CALLS", "CatalogService.fetchItem", "ServiceA.processPayment")],
+        )
+        with self._mock_registry([repo]):
+            result = cross_repo_callers_func(
+                symbol="ServiceA.processPayment", detail_level="minimal"
+            )
+
+        assert result["status"] == "ok"
+        assert result["total_callers"] == 1
+        caller = result["results"][0]
+        allowed = {"name", "kind", "file_path", "repo", "edge_confidence"}
+        assert set(caller.keys()) <= allowed
+        assert "qualified_name" not in caller
+        assert "repo_path" not in caller
+
+    def test_limit_truncates_results(self, tmp_path):
+        """limit parameter caps returned results and reports results_omitted."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        callers = [
+            (f"method{i}", f"ServiceX.method{i}") for i in range(5)
+        ]
+        edges = [
+            ("CALLS", f"ServiceX.method{i}", "ServiceA.processPayment")
+            for i in range(5)
+        ]
+        repo = self._make_db(
+            tmp_path / "large-service",
+            nodes=[("processPayment", "ServiceA.processPayment")] + callers,
+            edges=edges,
+        )
+        with self._mock_registry([repo]):
+            result = cross_repo_callers_func(
+                symbol="ServiceA.processPayment", limit=3
+            )
+
+        assert result["status"] == "ok"
+        assert len(result["results"]) == 3
+        assert result["total_callers"] == 5
+        assert result["results_omitted"] == 2
+
+    def test_failed_repo_skipped(self, tmp_path):
+        """If one repo raises an error, remaining repos still return results."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        good_repo = self._make_db(
+            tmp_path / "good-service",
+            nodes=[
+                ("processPayment", "ServiceA.processPayment"),
+                ("handleRequest", "GoodService.handleRequest"),
+            ],
+            edges=[("CALLS", "GoodService.handleRequest", "ServiceA.processPayment")],
+        )
+        bad_repo_path = str(tmp_path / "bad-service")
+
+        entries = [
+            {"path": bad_repo_path, "alias": "bad-service"},
+            {"path": good_repo, "alias": "good-service"},
+        ]
+        with patch(
+            "code_review_graph.registry.Registry"
+        ) as mock_cls:
+            mock_cls.return_value.list_repos.return_value = entries
+            mock_cls.return_value.get_data_dir_for_repo.return_value = None
+            result = cross_repo_callers_func(symbol="ServiceA.processPayment")
+
+        assert result["status"] == "ok"
+        assert result["total_callers"] == 1
+        assert result["results"][0]["repo"] == "good-service"
+
+
+class TestCrossRepoCallersTemporalStub:
+    """TEMPORAL_STUB edges are included in cross_repo_callers results."""
+
+    _SCHEMA = TestCrossRepoCallers._SCHEMA  # reuse minimal schema
+
+    def _make_db(self, tmp_path: Path, nodes, edges) -> str:
+        return TestCrossRepoCallers._make_db(self, tmp_path, nodes, edges)
+
+    def _mock_registry(self, repo_paths):
+        return TestCrossRepoCallers._mock_registry(self, repo_paths)
+
+    def test_temporal_stub_callers_found(self, tmp_path):
+        """TEMPORAL_STUB edges from a workflow to an activity appear as callers."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        repo = self._make_db(
+            tmp_path / "workflow-service",
+            nodes=[
+                ("processOrder", "OrderActivity.processOrder"),
+                ("executeWorkflow", "OrderWorkflowImpl.executeWorkflow"),
+            ],
+            edges=[
+                ("TEMPORAL_STUB", "OrderWorkflowImpl.executeWorkflow", "OrderActivity"),
+            ],
+        )
+        with self._mock_registry([repo]):
+            result = cross_repo_callers_func(symbol="OrderActivity")
+
+        assert result["status"] == "ok"
+        assert result["total_callers"] == 1
+        caller = result["results"][0]
+        assert caller["name"] == "executeWorkflow"
+        assert caller["edge_kind"] == "TEMPORAL_STUB"
+        assert caller.get("relationship") == "temporal"
+
+    def test_temporal_stub_cross_repo(self, tmp_path):
+        """TEMPORAL_STUB in repo-A resolves callers for activity defined in repo-B."""
+        from code_review_graph.tools.registry_tools import cross_repo_callers_func
+
+        # repo-A: has the workflow that stubs ShipmentActivity
+        repo_a = self._make_db(
+            tmp_path / "order-service",
+            nodes=[
+                ("processOrder", "OrderWorkflowImpl.processOrder"),
+            ],
+            edges=[
+                ("TEMPORAL_STUB", "OrderWorkflowImpl.processOrder", "ShipmentActivity"),
+            ],
+        )
+        # repo-B: defines ShipmentActivity interface (node exists here)
+        repo_b = self._make_db(
+            tmp_path / "shipment-service",
+            nodes=[
+                ("ShipmentActivity", "ShipmentActivity"),
+                ("dispatchShipment", "ShipmentActivityImpl.dispatchShipment"),
+            ],
+            edges=[],
+        )
+        with self._mock_registry([repo_a, repo_b]):
+            result = cross_repo_callers_func(symbol="ShipmentActivity")
+
+        assert result["status"] == "ok"
+        # order-service provides 1 TEMPORAL_STUB caller
+        assert result["total_callers"] >= 1
+        kinds = {r["edge_kind"] for r in result["results"]}
+        assert "TEMPORAL_STUB" in kinds
+        repos = {r["repo"] for r in result["results"]}
+        assert "order-service" in repos
+
+
+class TestCrossRepoKafkaImpact:
+    """Tests for cross_repo_kafka_impact_func — Kafka topic/message-type queries."""
+
+    _SCHEMA = TestCrossRepoCallers._SCHEMA
+
+    def _make_db_with_kafka(
+        self,
+        tmp_path: Path,
+        kafka_edges: list[tuple[str, str, str, str]],
+    ) -> str:
+        """Create a minimal graph.db with Kafka PRODUCES/CONSUMES edges.
+
+        Args:
+            kafka_edges: List of (kind, source_qualified, target_qualified, extra_json).
+        """
+        data_dir = tmp_path / ".code-review-graph"
+        data_dir.mkdir(parents=True)
+        db = data_dir / "graph.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(TestCrossRepoCallers._SCHEMA)
+        # Insert node for each source
+        sources = {e[1] for e in kafka_edges}
+        for src in sources:
+            name = src.split(".")[-1]
+            conn.execute(
+                "INSERT INTO nodes (name, qualified_name) VALUES (?, ?)",
+                (name, src),
+            )
+        for kind, src, tgt, extra in kafka_edges:
+            conn.execute(
+                "INSERT INTO edges (kind, source_qualified, target_qualified, extra)"
+                " VALUES (?, ?, ?, ?)",
+                (kind, src, tgt, extra),
+            )
+        conn.commit()
+        conn.close()
+        return str(tmp_path)
+
+    def _mock_registry(self, repo_paths):
+        return TestCrossRepoCallers._mock_registry(self, repo_paths)
+
+    def test_empty_registry(self, tmp_path):
+        """Empty registry returns ok with empty producers/consumers."""
+        from code_review_graph.tools.registry_tools import cross_repo_kafka_impact_func
+
+        with patch("code_review_graph.registry.Registry") as mock_cls:
+            mock_cls.return_value.list_repos.return_value = []
+            mock_cls.return_value.get_data_dir_for_repo.return_value = None
+            result = cross_repo_kafka_impact_func("OrderEvent")
+
+        assert result["status"] == "ok"
+        assert result["producers"] == []
+        assert result["consumers"] == []
+
+    def test_match_by_message_type(self, tmp_path):
+        """Matches PRODUCES/CONSUMES edges by message_type in extra JSON."""
+        from code_review_graph.tools.registry_tools import cross_repo_kafka_impact_func
+
+        import json
+        producer_repo = self._make_db_with_kafka(
+            tmp_path / "producer-service",
+            kafka_edges=[
+                (
+                    "PRODUCES",
+                    "OrderService.publishOrder",
+                    "kafka:config",
+                    json.dumps({"message_type": "OrderEvent", "kafka_type": "KafkaTemplate"}),
+                )
+            ],
+        )
+        consumer_repo = self._make_db_with_kafka(
+            tmp_path / "notification-service",
+            kafka_edges=[
+                (
+                    "CONSUMES",
+                    "NotificationListener.onOrder",
+                    "kafka:config",
+                    json.dumps({"message_type": "OrderEvent", "kafka_type": "KafkaListener"}),
+                )
+            ],
+        )
+        with self._mock_registry([producer_repo, consumer_repo]):
+            result = cross_repo_kafka_impact_func("OrderEvent")
+
+        assert result["status"] == "ok"
+        assert len(result["producers"]) == 1
+        assert len(result["consumers"]) == 1
+        assert result["producers"][0]["repo"] == "producer-service"
+        assert result["consumers"][0]["repo"] == "notification-service"
+
+    def test_match_by_topic_name(self, tmp_path):
+        """Matches edges by topic name in target_qualified."""
+        from code_review_graph.tools.registry_tools import cross_repo_kafka_impact_func
+
+        repo = self._make_db_with_kafka(
+            tmp_path / "order-service",
+            kafka_edges=[
+                ("CONSUMES", "OrderConsumer.handle", "kafka:order.created", "{}"),
+                ("PRODUCES", "OrderProducer.send", "kafka:order.created", "{}"),
+            ],
+        )
+        with self._mock_registry([repo]):
+            result = cross_repo_kafka_impact_func("order.created")
+
+        assert result["status"] == "ok"
+        assert len(result["producers"]) == 1
+        assert len(result["consumers"]) == 1
+
+    def test_no_match(self, tmp_path):
+        """Query with no matching topic or message type returns empty lists."""
+        from code_review_graph.tools.registry_tools import cross_repo_kafka_impact_func
+
+        import json
+        repo = self._make_db_with_kafka(
+            tmp_path / "other-service",
+            kafka_edges=[
+                (
+                    "CONSUMES",
+                    "SomeConsumer.handle",
+                    "kafka:config",
+                    json.dumps({"message_type": "ShipmentEvent"}),
+                )
+            ],
+        )
+        with self._mock_registry([repo]):
+            result = cross_repo_kafka_impact_func("OrderEvent")
+
+        assert result["status"] == "ok"
+        assert result["producers"] == []
+        assert result["consumers"] == []
+
+
 class TestSetDataDir:
     """Tests for set_data_dir and get_data_dir_for_repo methods."""
 

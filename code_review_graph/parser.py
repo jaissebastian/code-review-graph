@@ -12,7 +12,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Iterable, NamedTuple, Optional
 
 import tree_sitter_language_pack as tslp
 
@@ -526,13 +526,50 @@ _KAFKA_CONSUMER_TYPES = frozenset({
     "ConcurrentMessageListenerContainer",
 })
 
-# Kafka producer field types
+# Kafka producer field types (includes Spring Cloud Stream StreamBridge)
 _KAFKA_PRODUCER_TYPES = frozenset({
     "KafkaTemplate",
     "KafkaOperations",
     "ReactiveKafkaProducerTemplate",
     "KafkaSender",
+    "StreamBridge",         # Spring Cloud Stream functional producer
 })
+
+# Spring Cloud Stream functional consumer: @Bean Consumer<Message<X>> / Consumer<X>
+_SPRING_CLOUD_STREAM_FUNCTIONAL_CONSUMER = frozenset({"Consumer", "Function"})
+
+# Spring REST controller / HTTP mapping annotations
+_JAVA_REST_CONTROLLER_ANNOTATIONS = frozenset({"RestController", "Controller"})
+_HTTP_MAPPING_ANNOTATIONS: dict[str, str] = {
+    "GetMapping": "GET",
+    "PostMapping": "POST",
+    "PutMapping": "PUT",
+    "DeleteMapping": "DELETE",
+    "PatchMapping": "PATCH",
+    "RequestMapping": "ANY",
+}
+# Alias for annotation-to-method lookup used in REST endpoint detection.
+_HTTP_METHOD_FROM_ANNOTATION = _HTTP_MAPPING_ANNOTATIONS
+
+# Regex for fast pre-scan of Java static final String constants across a repo.
+# Used to resolve WebClient .uri(ClassName.CONSTANT) references.
+_JAVA_CONST_RE = re.compile(
+    rb"(?:public\s+|protected\s+|private\s+)?static\s+final\s+String\s+"
+    rb"(\w+)\s*=\s*\"([^\"]*)\"\s*;",
+    re.MULTILINE,
+)
+
+# Spring WebFlux RouterFunction builder HTTP method names (functional routing style).
+# These appear as .PUT("/path", handler), .GET("/path", handler) chains in @Bean methods.
+_ROUTER_HTTP_METHODS = frozenset({"PUT", "GET", "POST", "DELETE", "PATCH"})
+
+# Regex to extract path suffix from a Spring property value that contains a
+# ${PLACEHOLDER} base URL.  Handles both bare (``${HOST}/path``) and prefixed
+# (``http://${HOST}/path`` or ``https://${HOST}/path``) forms.
+_SPRING_URL_PATH_RE = re.compile(r".*\$\{[^}]+\}(/.+)")
+
+# Regex to extract the property key from a @Value("${prop.key}") annotation.
+_VALUE_PROP_KEY_RE = re.compile(r"\$\{([^}]+)\}")
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +860,173 @@ class CodeParser:
         self._tsconfig_resolver = TsconfigResolver()
         # Per-parse cache of Dart pubspec root lookups; see #87
         self._dart_pubspec_cache: dict[tuple[str, str], Optional[Path]] = {}
+        # Repo-wide Java static final String constants for WebClient URI resolution.
+        # Populated via prime_java_constants() before the main parse loop.
+        self._java_constant_map: dict[str, str] = {}
+        # property.key → REST path suffix, derived from application YAML/properties.
+        # e.g. "restClient.orderServiceUrl" → "/orders"
+        self._java_value_path_map: dict[str, str] = {}
+        # instance field name → REST path suffix, derived from @Value annotations.
+        # e.g. "orderServiceUrl" → "/orders"
+        self._java_field_path_map: dict[str, str] = {}
+
+    def prime_java_constants(self, files: Iterable[Path]) -> None:
+        """Fast regex pre-scan of Java files to collect static final String constants.
+
+        Must be called before parse_bytes() when cross-file constant resolution is
+        needed (e.g. WebClient .uri(ClassName.CONSTANT) references). Safe to skip —
+        only affects REST_CALLS edge resolution quality, not correctness.
+        """
+        for path in files:
+            if path.suffix.lower() != ".java":
+                continue
+            try:
+                source = path.read_bytes()
+            except OSError:
+                continue
+            for match in _JAVA_CONST_RE.finditer(source):
+                field_name = match.group(1).decode("utf-8", errors="replace")
+                value = match.group(2).decode("utf-8", errors="replace")
+                self._java_constant_map[field_name] = value
+
+    def prime_application_properties(self, files: Iterable[Path]) -> None:
+        """Pre-scan Spring application YAML/properties files to build property → path map.
+
+        Extracts path suffixes from property values of the form ``${PLACEHOLDER}/some/path``,
+        e.g. ``restClient.orderServiceUrl: ${HOST}/orders`` → ``/orders``.
+        Called before parse_bytes() so that @Value-injected WebClient fields can be resolved
+        to their path suffix during the main parse. Safe to skip — only affects REST_CALLS
+        edge resolution quality for @Value-style URL injection.
+        """
+        import yaml  # PyYAML is a project dependency
+
+        for path in files:
+            suffix = path.suffix.lower()
+            if suffix in (".yaml", ".yml"):
+                try:
+                    raw = path.read_text(encoding="utf-8", errors="replace")
+                    data = yaml.safe_load(raw)
+                    if isinstance(data, dict):
+                        self._flatten_yaml_for_rest(data, prefix="")
+                except Exception:
+                    pass
+            elif suffix == ".properties":
+                try:
+                    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" not in line:
+                            continue
+                        key, _, val = line.partition("=")
+                        key = key.strip()
+                        val = val.strip()
+                        m = _SPRING_URL_PATH_RE.match(val)
+                        if m:
+                            self._java_value_path_map[key] = m.group(1)
+                except Exception:
+                    pass
+
+    def _flatten_yaml_for_rest(self, data: dict, prefix: str) -> None:
+        """Recursively flatten a YAML dict and extract REST path suffixes from values."""
+        for k, v in data.items():
+            flat_key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                self._flatten_yaml_for_rest(v, flat_key)
+            elif isinstance(v, str):
+                m = _SPRING_URL_PATH_RE.match(v)
+                if m:
+                    self._java_value_path_map[flat_key] = m.group(1)
+
+    def _collect_value_field_paths(self, class_node) -> None:
+        """Scan a Java class body for @Value-annotated fields and map field names to path suffixes.
+
+        For each field annotated with ``@Value("${prop.key}")``, looks up prop.key in
+        ``_java_value_path_map`` (populated by prime_application_properties()) and adds
+        field_name → path_suffix to ``_java_field_path_map``. This enables resolving
+        WebClient ``.uri(fieldName)`` calls to the correct REST path.
+        """
+        for node in class_node.children:
+            if node.type != "class_body":
+                continue
+            for member in node.children:
+                if member.type == "field_declaration":
+                    value_key: Optional[str] = None
+                    field_name: Optional[str] = None
+                    for child in member.children:
+                        if child.type == "modifiers":
+                            for mod in child.children:
+                                if mod.type != "annotation":
+                                    continue
+                                ann_id = next(
+                                    (c.text.decode("utf-8", errors="replace")
+                                     for c in mod.children if c.type == "identifier"),
+                                    None,
+                                )
+                                if ann_id != "Value":
+                                    continue
+                                for arg_list in mod.children:
+                                    if arg_list.type != "annotation_argument_list":
+                                        continue
+                                    for arg in arg_list.children:
+                                        if arg.type == "string_literal":
+                                            raw = arg.text.decode(
+                                                "utf-8", errors="replace"
+                                            ).strip('"')
+                                            m = _VALUE_PROP_KEY_RE.search(raw)
+                                            if m:
+                                                value_key = m.group(1)
+                        elif child.type == "variable_declarator":
+                            for sub in child.children:
+                                if sub.type == "identifier":
+                                    field_name = sub.text.decode("utf-8", errors="replace")
+                                    break
+                    if value_key and field_name:
+                        path_suffix = self._java_value_path_map.get(value_key)
+                        if path_suffix:
+                            self._java_field_path_map[field_name] = path_suffix
+                elif member.type == "constructor_declaration":
+                    # Also scan constructor parameters for @Value("${prop.key}").
+                    # Pattern: ServiceA(@Value("${prop}") String fieldName) { this.fieldName = ... }
+                    for child in member.children:
+                        if child.type != "formal_parameters":
+                            continue
+                        for param in child.children:
+                            if param.type != "formal_parameter":
+                                continue
+                            p_value_key: Optional[str] = None
+                            p_field_name: Optional[str] = None
+                            for p_child in param.children:
+                                if p_child.type == "modifiers":
+                                    for mod in p_child.children:
+                                        if mod.type != "annotation":
+                                            continue
+                                        ann_id = next(
+                                            (c.text.decode("utf-8", errors="replace")
+                                             for c in mod.children if c.type == "identifier"),
+                                            None,
+                                        )
+                                        if ann_id != "Value":
+                                            continue
+                                        for arg_list in mod.children:
+                                            if arg_list.type != "annotation_argument_list":
+                                                continue
+                                            for arg in arg_list.children:
+                                                if arg.type == "string_literal":
+                                                    raw = arg.text.decode(
+                                                        "utf-8", errors="replace"
+                                                    ).strip('"')
+                                                    m2 = _VALUE_PROP_KEY_RE.search(raw)
+                                                    if m2:
+                                                        p_value_key = m2.group(1)
+                                elif p_child.type == "identifier":
+                                    p_field_name = p_child.text.decode(
+                                        "utf-8", errors="replace"
+                                    )
+                            if p_value_key and p_field_name:
+                                path_suffix = self._java_value_path_map.get(p_value_key)
+                                if path_suffix:
+                                    self._java_field_path_map[p_field_name] = path_suffix
 
     def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
@@ -2348,6 +2552,7 @@ class CodeParser:
         import_map: Optional[dict[str, str]] = None,
         defined_names: Optional[set[str]] = None,
         _depth: int = 0,
+        class_rest_prefix: Optional[str] = None,
     ) -> None:
         """Recursively walk the AST and extract nodes/edges."""
         if _depth > self._MAX_AST_DEPTH:
@@ -2477,6 +2682,7 @@ class CodeParser:
                 child, source, language, file_path, nodes, edges,
                 enclosing_class, import_map, defined_names,
                 _depth, enclosing_func,
+                class_rest_prefix=class_rest_prefix,
             ):
                 continue
 
@@ -2528,6 +2734,7 @@ class CodeParser:
                 enclosing_func=enclosing_func,
                 import_map=import_map, defined_names=defined_names,
                 _depth=_depth + 1,
+                class_rest_prefix=class_rest_prefix,
             )
 
     def _elixir_call_identifier(self, node) -> Optional[str]:
@@ -4453,7 +4660,7 @@ class CodeParser:
         Handles:
         - KafkaReceiver / ReactiveKafkaConsumerTemplate → CONSUMES
         - KafkaTemplate / KafkaOperations / ReactiveKafkaProducerTemplate → PRODUCES
-        Generic value type (e.g. KafkaReceiver<String, EquipmentMove>) is
+        Generic value type (e.g. KafkaReceiver<String, OrderEvent>) is
         stored in extra.message_type for traceability.
         """
         qualified_source = self._qualify(class_name, file_path, None)
@@ -4477,7 +4684,7 @@ class CodeParser:
                     elif ch.type == "type_identifier":
                         outer_type = ch.text.decode("utf-8", errors="replace")
                     elif ch.type == "generic_type":
-                        # KafkaReceiver<String, EquipmentMove>
+                        # KafkaReceiver<String, OrderEvent>
                         type_args: list[str] = []
                         for sub in ch.children:
                             if sub.type == "type_identifier":
@@ -4569,6 +4776,278 @@ class CodeParser:
                         line=method_node.start_point[0] + 1,
                         extra={"kafka_type": ann_name},
                     ))
+
+    def _emit_kafka_edges_from_stream_bean(
+        self,
+        method_node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        ret_type: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit CONSUMES edges for Spring Cloud Stream functional consumer beans.
+
+        Handles: ``@Bean Consumer<Message<PayloadType>> bindingName() { ... }``
+        The outer wrapper type (Consumer or Function) is ignored; the message
+        payload type extracted from the generic params is stored as message_type.
+        """
+        # For Java, _get_return_type may be None (generic return types aren't
+        # captured by the generic child-type scan). Fall back to reading the
+        # method node's first generic_type or type_identifier child directly.
+        raw = ret_type or ""
+        if not raw:
+            for ch in method_node.children:
+                if ch.type in ("generic_type", "type_identifier"):
+                    raw = ch.text.decode("utf-8", errors="replace")
+                    break
+
+        if not raw:
+            return
+
+        # ret_type examples: "Consumer<Message<OrderEvent>>", "Consumer<PaymentEvent>"
+        outer = raw.split("<")[0].strip()
+        if outer not in _SPRING_CLOUD_STREAM_FUNCTIONAL_CONSUMER:
+            return
+
+        ret_type = raw  # use resolved value for generic param extraction
+
+        # Extract innermost type argument as message_type
+        # "Consumer<Message<OrderEvent>>" → "OrderEvent"
+        # "Consumer<OrderEvent>" → "OrderEvent"
+        msg_type: Optional[str] = None
+        depth = 0
+        current: list[str] = []
+        parts: list[str] = []
+        for ch in ret_type:
+            if ch == "<":
+                depth += 1
+                if depth > 1:
+                    current.append(ch)
+            elif ch == ">":
+                depth -= 1
+                if depth == 0 and current:
+                    parts.append("".join(current).strip())
+                    current = []
+                elif depth > 0:
+                    current.append(ch)
+            elif ch == "," and depth == 1:
+                parts.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            parts.append("".join(current).strip())
+
+        for part in parts:
+            # Strip outer "Message<X>" wrapper if present
+            inner = part
+            if inner.startswith("Message<") and inner.endswith(">"):
+                inner = inner[len("Message<"):-1].strip()
+            if inner and inner not in ("?", "Object", "byte[]", "String"):
+                msg_type = inner
+                break
+
+        qualified_source = self._qualify(method_name, file_path, class_name)
+        edges.append(EdgeInfo(
+            kind="CONSUMES",
+            source=qualified_source,
+            target="kafka:config",
+            file_path=file_path,
+            line=method_node.start_point[0] + 1,
+            extra={
+                "kafka_type": "SpringCloudStream",
+                "binding_name": method_name,
+                **({"message_type": msg_type} if msg_type else {}),
+            },
+        ))
+
+    # -----------------------------------------------------------------------
+    # REST endpoint / WebClient URI extraction helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _get_http_mapping_path(annotation_node) -> Optional[str]:
+        """Extract the path string from an HTTP mapping annotation AST node.
+
+        Handles both positional (@GetMapping("/path")) and named
+        (@RequestMapping(value="/path") or path="/path") forms.
+        """
+        for child in annotation_node.children:
+            if child.type != "annotation_argument_list":
+                continue
+            for pair in child.children:
+                if pair.type == "element_value_pair":
+                    key_node = next(
+                        (c for c in pair.children if c.type == "identifier"), None
+                    )
+                    if key_node is None:
+                        continue
+                    if key_node.text.decode("utf-8", errors="replace") not in (
+                        "value", "path"
+                    ):
+                        continue
+                    for val in pair.children:
+                        if val.type == "string_literal":
+                            return val.text.decode("utf-8", errors="replace").strip('"')
+                elif pair.type == "string_literal":
+                    # Positional single-value form: @GetMapping("/path")
+                    return pair.text.decode("utf-8", errors="replace").strip('"')
+        return None
+
+    def _resolve_uri_arg(self, method_inv_node) -> Optional[str]:
+        """Extract the resolved path string from a .uri(X) argument.
+
+        Handles string literals and field_access/identifier constants resolved
+        via self._java_constant_map (populated by prime_java_constants()).
+        """
+        for child in method_inv_node.children:
+            if child.type != "argument_list":
+                continue
+            for arg in child.children:
+                if arg.type == "string_literal":
+                    raw = arg.text.decode("utf-8", errors="replace").strip('"')
+                    # Accept path-only strings; full URLs → extract path component
+                    if raw.startswith("http"):
+                        try:
+                            from urllib.parse import urlparse
+                            raw = urlparse(raw).path
+                        except Exception:
+                            pass
+                    return raw if raw.startswith("/") else None
+                if arg.type == "field_access":
+                    # ClassName.FIELD_NAME — take the last identifier as field name
+                    field_name: Optional[str] = None
+                    for c in arg.children:
+                        if c.type == "identifier":
+                            field_name = c.text.decode("utf-8", errors="replace")
+                    if field_name and field_name in self._java_constant_map:
+                        v = self._java_constant_map[field_name]
+                        return v if v.startswith("/") else None
+                if arg.type == "identifier":
+                    name = arg.text.decode("utf-8", errors="replace")
+                    # @Value-injected field → path suffix (highest priority)
+                    if name in self._java_field_path_map:
+                        return self._java_field_path_map[name]
+                    if name in self._java_constant_map:
+                        v = self._java_constant_map[name]
+                        return v if v.startswith("/") else None
+        return None
+
+    def _emit_rest_calls_from_webclient(
+        self,
+        method_node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Walk method body AST to find WebClient .uri() calls and emit REST_CALLS edges."""
+        seen: set[tuple[str, str]] = set()
+        self._walk_for_uri(method_node, method_name, class_name, file_path, edges, seen)
+
+    def _walk_for_uri(
+        self,
+        node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        edges: list[EdgeInfo],
+        seen: "set[tuple[str, str]]",
+    ) -> None:
+        for child in node.children:
+            if child.type == "method_invocation":
+                caller_method, _ = self._get_java_method_and_receiver(child)
+                if caller_method == "uri":
+                    path = self._resolve_uri_arg(child)
+                    if path:
+                        source_qn = self._qualify(method_name, file_path, class_name)
+                        target = f"rest:path:{path.rstrip('/') or '/'}"
+                        key = (source_qn, target)
+                        if key not in seen:
+                            seen.add(key)
+                            edges.append(EdgeInfo(
+                                kind="REST_CALLS",
+                                source=source_qn,
+                                target=target,
+                                file_path=file_path,
+                                line=child.start_point[0] + 1,
+                            ))
+            self._walk_for_uri(
+                child, method_name, class_name, file_path, edges, seen
+            )
+
+    def _emit_router_function_endpoints(
+        self,
+        method_node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        edges: list[EdgeInfo],
+    ) -> None:
+        """Emit REST_ENDPOINT edges for Spring WebFlux functional routing style.
+
+        Handles @Bean methods that return RouterFunction<?>, where routes are
+        defined via builder chains such as route().PUT("/path", handler::method).
+        Emits a REST_ENDPOINT edge for each HTTP method+path pair found.
+        """
+        # Check that return type contains RouterFunction before walking the body
+        has_router_return = False
+        for ch in method_node.children:
+            if ch.type in ("generic_type", "type_identifier"):
+                text = ch.text.decode("utf-8", errors="replace")
+                if "RouterFunction" in text:
+                    has_router_return = True
+                    break
+        if not has_router_return:
+            return
+
+        seen: set[tuple[str, str]] = set()
+        self._walk_for_router_routes(method_node, method_name, class_name, file_path, edges, seen)
+
+    def _walk_for_router_routes(
+        self,
+        node,
+        method_name: str,
+        class_name: Optional[str],
+        file_path: str,
+        edges: list[EdgeInfo],
+        seen: "set[tuple[str, str]]",
+    ) -> None:
+        """Recursively walk AST to find .PUT("/path"), .GET("/path") etc. in router chains."""
+        for child in node.children:
+            if child.type == "method_invocation":
+                caller_method, _ = self._get_java_method_and_receiver(child)
+                if caller_method and caller_method.upper() in _ROUTER_HTTP_METHODS:
+                    # First string literal arg in argument_list is the path
+                    path: Optional[str] = None
+                    for arg_list in child.children:
+                        if arg_list.type != "argument_list":
+                            continue
+                        for arg in arg_list.children:
+                            if arg.type == "string_literal":
+                                raw = arg.text.decode("utf-8", errors="replace").strip('"')
+                                if raw.startswith("/"):
+                                    path = raw
+                                break
+                        break
+                    if path:
+                        source_qn = self._qualify(method_name, file_path, class_name)
+                        target = f"rest:path:{path.rstrip('/') or '/'}"
+                        key = (source_qn, target)
+                        if key not in seen:
+                            seen.add(key)
+                            edges.append(EdgeInfo(
+                                kind="REST_ENDPOINT",
+                                source=source_qn,
+                                target=target,
+                                file_path=file_path,
+                                line=child.start_point[0] + 1,
+                                extra={"http_method": caller_method.upper()},
+                            ))
+            self._walk_for_router_routes(
+                child, method_name, class_name, file_path, edges, seen
+            )
 
     def _extract_classes(
         self,
@@ -4673,6 +5152,33 @@ class CodeParser:
             self._emit_temporal_stub_fields(child, name, file_path, edges)
             # Kafka: emit CONSUMES/PRODUCES edges for Kafka field declarations
             self._emit_kafka_edges_from_class(child, name, file_path, edges)
+            # REST: map @Value-annotated String fields to path suffixes for WebClient resolution
+            self._collect_value_field_paths(child)
+
+        # REST: determine class_rest_prefix for @RestController/@Controller classes.
+        # None means "not a REST controller"; "" means "controller with no class-level path".
+        class_rest_prefix: Optional[str] = None
+        if language == "java" and any(
+            a.split("(")[0].strip() in _JAVA_REST_CONTROLLER_ANNOTATIONS
+            for a in class_annotations
+        ):
+            class_rest_prefix = ""
+            for sub in child.children:
+                if sub.type != "modifiers":
+                    continue
+                for mod in sub.children:
+                    if mod.type not in ("annotation", "marker_annotation"):
+                        continue
+                    ann_id = next(
+                        (c.text.decode("utf-8", errors="replace")
+                         for c in mod.children if c.type == "identifier"),
+                        None,
+                    )
+                    if ann_id == "RequestMapping":
+                        path = self._get_http_mapping_path(mod)
+                        if path:
+                            class_rest_prefix = path
+                        break
 
         # Recurse into class body
         self._extract_from_tree(
@@ -4680,6 +5186,7 @@ class CodeParser:
             enclosing_class=name, enclosing_func=None,
             import_map=import_map, defined_names=defined_names,
             _depth=_depth + 1,
+            class_rest_prefix=class_rest_prefix,
         )
         return True
 
@@ -4696,6 +5203,7 @@ class CodeParser:
         defined_names: Optional[set[str]],
         _depth: int,
         enclosing_func: Optional[str] = None,
+        class_rest_prefix: Optional[str] = None,
     ) -> bool:
         """Extract a function/method definition node.
 
@@ -4771,6 +5279,50 @@ class CodeParser:
                 self._emit_bean_parameter_injections(
                     child, name, enclosing_class, file_path, edges,
                 )
+            # Spring Cloud Stream functional consumer: @Bean returning Consumer<Message<X>>
+            # e.g. @Bean public Consumer<Message<OrderEvent>> processOrders() { ... }
+            # Note: ret_type is None for Java generic return types; the method reads
+            # the AST children directly as a fallback.
+            if "Bean" in deco_list:
+                self._emit_kafka_edges_from_stream_bean(
+                    child, name, enclosing_class, file_path, ret_type, edges,
+                )
+                # Spring WebFlux functional routing: @Bean returning RouterFunction<?>
+                self._emit_router_function_endpoints(
+                    child, name, enclosing_class, file_path, edges,
+                )
+
+        # REST endpoint annotation: collect rest_endpoint / http_method into extra.
+        # class_rest_prefix is not None only for @RestController/@Controller classes.
+        if language == "java" and class_rest_prefix is not None:
+            for sub in child.children:
+                if sub.type != "modifiers":
+                    continue
+                for mod in sub.children:
+                    if mod.type not in ("annotation", "marker_annotation"):
+                        continue
+                    ann_id = next(
+                        (c.text.decode("utf-8", errors="replace")
+                         for c in mod.children if c.type == "identifier"),
+                        None,
+                    )
+                    if ann_id not in _HTTP_MAPPING_ANNOTATIONS:
+                        continue
+                    method_path = self._get_http_mapping_path(mod) or ""
+                    prefix = class_rest_prefix.rstrip("/")
+                    suffix = method_path.lstrip("/")
+                    full_path = f"{prefix}/{suffix}" if suffix else prefix or "/"
+                    method_extra["rest_endpoint"] = full_path
+                    method_extra["http_method"] = _HTTP_METHOD_FROM_ANNOTATION.get(
+                        ann_id, "ANY"
+                    )
+                    break
+
+        # WebClient URI extraction: emit REST_CALLS edges for .uri() calls in body.
+        if language == "java":
+            self._emit_rest_calls_from_webclient(
+                child, name, enclosing_class, file_path, edges,
+            )
 
         node = NodeInfo(
             kind=kind,
