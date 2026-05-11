@@ -797,7 +797,7 @@ def find_dependents(
 
 
 def _parse_single_file(
-    args: tuple[str, str],
+    args: tuple,
 ) -> tuple[str, list, list, str | None, str]:
     """Parse one file in a worker process.
 
@@ -805,12 +805,18 @@ def _parse_single_file(
     Must be a module-level function so ``ProcessPoolExecutor`` can
     serialise it across processes.
     """
-    rel_path, repo_root_str = args
+    rel_path, repo_root_str = args[0], args[1]
+    java_const_map: dict = args[2] if len(args) > 2 else {}
+    java_value_path_map: dict = args[3] if len(args) > 3 else {}
     abs_path = Path(repo_root_str) / rel_path
     try:
         raw = abs_path.read_bytes()
         fhash = hashlib.sha256(raw).hexdigest()
         parser = CodeParser()
+        if java_const_map:
+            parser._java_constant_map = java_const_map
+        if java_value_path_map:
+            parser._java_value_path_map = java_value_path_map
         nodes, edges = parser.parse_bytes(abs_path, raw)
         return (rel_path, nodes, edges, None, fhash)
     except Exception as e:
@@ -832,6 +838,21 @@ def full_build(
     """
     parser = CodeParser()
     files = collect_all_files(repo_root, recurse_submodules)
+
+    # Pre-scan Java files for static final String constants so WebClient .uri()
+    # references can be resolved across file boundaries during the main parse.
+    parser.prime_java_constants(repo_root / f for f in files)
+    # Pre-scan Spring application config files so @Value-injected URL fields can
+    # be resolved to their path suffixes during the main parse.
+    parser.prime_application_properties(
+        repo_root.rglob("application*.yaml"),
+    )
+    parser.prime_application_properties(
+        repo_root.rglob("application*.yml"),
+    )
+    parser.prime_application_properties(
+        repo_root.rglob("application*.properties"),
+    )
 
     # Purge stale data from files no longer on disk
     existing_files = set(store.get_all_files())
@@ -874,7 +895,11 @@ def full_build(
         # Executor kind auto-selected: process on Linux/macOS/Windows-TTY,
         # thread on Windows-MCP-stdio to avoid pipe-handle inheritance
         # deadlock (issues #46, #136). Override via CRG_PARSE_EXECUTOR env.
-        args_list = [(rel_path, str(repo_root)) for rel_path in files]
+        const_map = parser._java_constant_map
+        value_path_map = parser._java_value_path_map
+        args_list = [
+            (rel_path, str(repo_root), const_map, value_path_map) for rel_path in files
+        ]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for i, (rel_path, nodes, edges, error, fhash) in enumerate(
                 executor.map(_parse_single_file, args_list, chunksize=20),
@@ -925,6 +950,12 @@ def incremental_update(
     """Incremental update: re-parse changed + dependent files only."""
     parser = CodeParser()
     ignore_patterns = _load_ignore_patterns(repo_root)
+    # Pre-scan all Java files in repo for constants (needed for cross-file
+    # WebClient .uri() resolution even in incremental builds).
+    parser.prime_java_constants(repo_root.rglob("*.java"))
+    parser.prime_application_properties(repo_root.rglob("application*.yaml"))
+    parser.prime_application_properties(repo_root.rglob("application*.yml"))
+    parser.prime_application_properties(repo_root.rglob("application*.properties"))
 
     # Determine changed files
     if changed_files is None:
@@ -1006,7 +1037,11 @@ def incremental_update(
                 errors.append({"file": rel_path, "error": str(e)})
     else:
         # See full-build comment above for executor kind rationale.
-        args_list = [(rel_path, str(repo_root)) for rel_path in to_parse]
+        const_map = parser._java_constant_map
+        value_path_map = parser._java_value_path_map
+        args_list = [
+            (rel_path, str(repo_root), const_map, value_path_map) for rel_path in to_parse
+        ]
         with _make_executor(_MAX_PARSE_WORKERS) as executor:
             for rel_path, nodes, edges, error, fhash in executor.map(
                 _parse_single_file,

@@ -93,7 +93,13 @@ from .query import (
 from .refactor_tools import apply_refactor_func, refactor_func
 
 # -- registry_tools ---------------------------------------------------------
-from .registry_tools import cross_repo_search_func, list_repos_func
+from .registry_tools import (
+    cross_repo_callers_func,
+    cross_repo_kafka_impact_func,
+    cross_repo_rest_callers_func,
+    cross_repo_search_func,
+    list_repos_func,
+)
 
 # -- review -----------------------------------------------------------------
 from .review import (
@@ -135,6 +141,9 @@ __all__ = [
     "apply_refactor_func",
     "refactor_func",
     # registry_tools
+    "cross_repo_callers_func",
+    "cross_repo_kafka_impact_func",
+    "cross_repo_rest_callers_func",
     "cross_repo_search_func",
     "list_repos_func",
     # review
